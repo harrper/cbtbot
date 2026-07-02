@@ -9,7 +9,8 @@
 ```text
 TELEGRAM_BOT_TOKEN=токен_из_BotFather
 OPENAI_API_KEY=ключ_OpenAI
-GOOGLE_DOC_ID=ID_Google_Документа
+GOOGLE_SHEET_ID=ID_Google_Таблицы
+GOOGLE_SHEET_RANGE=необязательно_например_Лист1!A:D
 GOOGLE_SERVICE_ACCOUNT_JSON=JSON_сервисного_аккаунта_Google
 # или GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=JSON_сервисного_аккаунта_в_base64
 ```
@@ -22,9 +23,9 @@ OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 TIMEZONE=Europe/Moscow
 ```
 
-Для сохранения в Google Docs нужно создать сервисный аккаунт в Google Cloud,
-включить Google Docs API и дать email сервисного аккаунта доступ на редактирование
-к нужному Google Документу.
+Для сохранения в Google Sheets нужно создать сервисный аккаунт в Google Cloud,
+включить Google Sheets API и дать email сервисного аккаунта доступ на редактирование
+к нужной Google Таблице.
 
 ## Локальный запуск
 

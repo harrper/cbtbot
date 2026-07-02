@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
-GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents"
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 
 
@@ -123,14 +123,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
     try:
-        document_url = save_transcript_to_google_doc(transcript)
+            spreadsheet_url = save_transcript_to_google_sheet(transcript)
     except RuntimeError as error:
-        logger.info("Google Docs is not configured: %s", error)
+        logger.info("Google Sheets is not configured: %s", error)
     except Exception:
-        logger.exception("Failed to save transcript to Google Docs")
-        await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Docs.")
+        logger.exception("Failed to save transcript to Google Sheets")
+        await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Sheets.")
     else:
-        await update.message.reply_text(f"Сохранил расшифровку в Google Docs:\n{document_url}")
+        await update.message.reply_text(f"Сохранил расшифровку в Google Sheets:\n{spreadsheet_url}")
 
 
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -162,35 +162,49 @@ async def transcribe_audio(audio_path: Path) -> str:
             return response.text.strip()
 
 
-def save_transcript_to_google_doc(transcript: str) -> str:
-    document_id = os.getenv("GOOGLE_DOC_ID")
-    if not document_id:
-        raise RuntimeError("Set GOOGLE_DOC_ID to enable Google Docs saving.")
+def save_transcript_to_google_sheet(transcript: str) -> str:
+    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
 
-    docs_service = build_google_docs_service()
-    document = docs_service.documents().get(documentId=document_id).execute()
-    end_index = document["body"]["content"][-1]["endIndex"]
+    sheets_service = build_google_service("sheets", "v4")
+    sheet_range = get_google_sheet_range(sheets_service, spreadsheet_id)
     timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"\n\n{timestamp}\n{transcript}\n"
 
-    docs_service.documents().batchUpdate(
-        documentId=document_id,
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=sheet_range,
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
         body={
-            "requests": [
-                {
-                    "insertText": {
-                        "location": {"index": max(end_index - 1, 1)},
-                        "text": entry,
-                    }
-                }
+            "values": [
+                [
+                    timestamp,
+                    "voice",
+                    transcript,
+                    TRANSCRIPTION_MODEL,
+                ]
             ]
         },
     ).execute()
 
-    return f"https://docs.google.com/document/d/{document_id}/edit"
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
 
 
-def build_google_docs_service():
+def get_google_sheet_range(sheets_service, spreadsheet_id: str) -> str:
+    configured_range = os.getenv("GOOGLE_SHEET_RANGE")
+    if configured_range:
+        return configured_range
+
+    spreadsheet = sheets_service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets.properties.title",
+    ).execute()
+    first_sheet_title = spreadsheet["sheets"][0]["properties"]["title"]
+    return f"{first_sheet_title}!A:D"
+
+
+def build_google_service(service_name: str, version: str):
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     service_account_json_base64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")
@@ -205,19 +219,19 @@ def build_google_docs_service():
     if service_account_info:
         credentials = service_account.Credentials.from_service_account_info(
             service_account_info,
-            scopes=[GOOGLE_DOCS_SCOPE],
+            scopes=GOOGLE_SCOPES,
         )
     elif credentials_path:
         credentials = service_account.Credentials.from_service_account_file(
             credentials_path,
-            scopes=[GOOGLE_DOCS_SCOPE],
+            scopes=GOOGLE_SCOPES,
         )
     else:
         raise RuntimeError(
             "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
         )
 
-    return build("docs", "v1", credentials=credentials)
+    return build(service_name, version, credentials=credentials)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
