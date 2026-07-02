@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 .DS_Store
+key-for-github
+key-for-github.pub
