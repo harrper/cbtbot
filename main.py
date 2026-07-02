@@ -33,13 +33,16 @@ TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-trans
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = os.getenv("APP_VERSION", "v0.5.0-sheets-headers")
+APP_VERSION = os.getenv("APP_VERSION", "v0.7.1-allowed-user-status")
+EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
     "текст сообщения": "transcript",
     "исходная расшифровка": "transcript",
     "расшифровка": "transcript",
+    "интенсивность": "intensity",
     "ситуация": "situation",
     "мысли": "thoughts",
     "эмоции": "emotions",
@@ -91,6 +94,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     text = update.message.text or ""
+    if text.strip() == "/?":
+        await update.message.reply_text(format_status_message())
+        return
+
     await update.message.reply_text(f"Получил текст: {text}")
 
 
@@ -139,8 +146,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
+
     try:
-        spreadsheet_url = save_transcript_to_google_sheet(transcript)
+        journal_entry = await extract_journal_entry(transcript)
+    except httpx.HTTPStatusError as error:
+        openai_error = error.response.text
+        logger.exception("OpenAI extraction failed: %s", openai_error)
+        await update.message.reply_text(
+            "Расшифровка готова, но не получилось разобрать запись через OpenAI. "
+            f"OpenAI вернул статус {error.response.status_code}.\n\n"
+            f"Детали: {openai_error[:900]}"
+        )
+        return
+    except Exception:
+        logger.exception("Journal extraction failed")
+        await update.message.reply_text("Расшифровка готова, но не получилось разобрать дневниковую запись.")
+        return
+
+    if not journal_entry["is_journal_entry"]:
+        reason = journal_entry.get("reason") or "не является дневниковой записью об эмоциях"
+        await update.message.reply_text(
+            "Запись не может быть обработана, потому что не является дневниковой записью об эмоциях.\n\n"
+            f"Причина: {reason}"
+        )
+        return
+
+    await update.message.reply_text(format_journal_entry_summary(journal_entry))
+
+    try:
+        spreadsheet_url = save_transcript_to_google_sheet(transcript, journal_entry)
     except RuntimeError as error:
         logger.info("Google Sheets is not configured: %s", error)
         await update.message.reply_text(
@@ -183,7 +217,134 @@ async def transcribe_audio(audio_path: Path) -> str:
             return response.text.strip()
 
 
-def save_transcript_to_google_sheet(transcript: str) -> str:
+async def extract_journal_entry(transcript: str) -> dict:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set OPENAI_API_KEY in environment variables.")
+
+    payload = {
+        "model": EXTRACTION_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Ты извлекаешь данные для КПТ-дневника из одной пользовательской записи. "
+                            "Ничего не додумывай и не интерпретируй. Заполняй поле только если это прямо "
+                            "сказано в тексте. Если запись не описывает эмоциональное состояние, переживание, "
+                            "ситуацию с эмоциями или дневниковую запись о чувствах, верни is_journal_entry=false. "
+                            "Поле reason всегда пиши по-русски. "
+                            "Интенсивность извлекай только если пользователь явно указал именно силу/оценку "
+                            "эмоции: например '8 из 10', '70%', 'очень сильная', 'слабая', 'умеренная'. "
+                            "Не записывай в интенсивность названия эмоций вроде 'тревога', 'паника', "
+                            "'злость' и не делай вывод о силе по словам 'даже', 'очень испугался' или "
+                            "по общему смыслу. Если явной оценки силы нет — оставь intensity пустым. "
+                            "Ощущения — только телесные реакции, которые возникли как следствие эмоций, "
+                            "мыслей или переживания: например ком в горле, сжатие в груди, дрожь, жар, "
+                            "напряжение, учащенное сердцебиение. Не записывай в ощущения физический симптом, "
+                            "боль или телесное событие, если оно является триггером/частью ситуации: например "
+                            "заболела коленка, заболела голова, усталость, травма. Такой триггер относится "
+                            "к ситуации. Если телесная реакция на эмоцию прямо не названа — оставь sensations "
+                            "пустым. Действия — только явно указанные предпринятые действия."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": transcript,
+                    }
+                ],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "cbt_journal_entry",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "is_journal_entry": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "intensity": {"type": "string"},
+                        "situation": {"type": "string"},
+                        "thoughts": {"type": "string"},
+                        "emotions": {"type": "string"},
+                        "sensations": {"type": "string"},
+                        "actions": {"type": "string"},
+                    },
+                    "required": [
+                        "is_journal_entry",
+                        "reason",
+                        "intensity",
+                        "situation",
+                        "thoughts",
+                        "emotions",
+                        "sensations",
+                        "actions",
+                    ],
+                },
+            }
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            OPENAI_RESPONSES_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    return json.loads(extract_response_text(data))
+
+
+def extract_response_text(response_data: dict) -> str:
+    for output_item in response_data.get("output", []):
+        for content_item in output_item.get("content", []):
+            if content_item.get("type") == "output_text":
+                return content_item.get("text", "")
+
+    raise RuntimeError("OpenAI response did not contain output_text.")
+
+
+def format_journal_entry_summary(journal_entry: dict) -> str:
+    def value(field_name: str) -> str:
+        return journal_entry.get(field_name) or "не указано"
+
+    return (
+        "Разбор записи:\n\n"
+        f"Интенсивность: {value('intensity')}\n"
+        f"Ситуация: {value('situation')}\n"
+        f"Мысли: {value('thoughts')}\n"
+        f"Эмоции: {value('emotions')}\n"
+        f"Ощущения в теле: {value('sensations')}\n"
+        f"Действия: {value('actions')}"
+    )
+
+
+def format_status_message() -> str:
+    allowed_user_id = os.getenv("ALLOWED_TELEGRAM_USER_ID")
+    access_line = (
+        f"Работает только для Telegram ID: {allowed_user_id}"
+        if allowed_user_id
+        else "ALLOWED_TELEGRAM_USER_ID не указан. Бот сейчас отвечает всем."
+    )
+    return f"Версия: {APP_VERSION}\n{access_line}"
+
+
+def save_transcript_to_google_sheet(transcript: str, journal_entry: dict | None = None) -> str:
     spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
     if not spreadsheet_id:
         raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
@@ -193,7 +354,7 @@ def save_transcript_to_google_sheet(transcript: str) -> str:
     headers = get_sheet_headers(sheets_service, spreadsheet_id, sheet_title)
     append_range = f"{sheet_title}!A:{column_letter(len(headers))}"
     timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-    row = build_sheet_row(headers, transcript, timestamp)
+    row = build_sheet_row(headers, transcript, timestamp, journal_entry or {})
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
@@ -227,15 +388,22 @@ def get_sheet_headers(sheets_service, spreadsheet_id: str, sheet_title: str) -> 
     return values[0]
 
 
-def build_sheet_row(headers: list[str], transcript: str, timestamp: str) -> list[str]:
+def build_sheet_row(
+    headers: list[str],
+    transcript: str,
+    timestamp: str,
+    journal_entry: dict | None = None,
+) -> list[str]:
+    journal_entry = journal_entry or {}
     values = {
         "timestamp": timestamp,
         "transcript": transcript,
-        "situation": "",
-        "thoughts": "",
-        "emotions": "",
-        "sensations": "",
-        "actions": "",
+        "intensity": journal_entry.get("intensity", ""),
+        "situation": journal_entry.get("situation", ""),
+        "thoughts": journal_entry.get("thoughts", ""),
+        "emotions": journal_entry.get("emotions", ""),
+        "sensations": journal_entry.get("sensations", ""),
+        "actions": journal_entry.get("actions", ""),
     }
 
     row = []
