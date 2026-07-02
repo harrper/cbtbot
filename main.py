@@ -33,6 +33,7 @@ TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-trans
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+APP_VERSION = os.getenv("APP_VERSION", "v0.5.0-sheets-headers")
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
@@ -103,7 +104,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Не получилось прочитать голосовое.")
         return
 
-    await update.message.reply_text(f"Получил голосовое на {duration} сек. Расшифровываю...")
+    await update.message.reply_text(
+        f"Получил голосовое на {duration} сек. Расшифровываю...\n"
+        f"Версия: {APP_VERSION}"
+    )
 
     audio_path: Path | None = None
     try:

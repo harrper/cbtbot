@@ -20,6 +20,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON=JSON_сервисного_аккаунта_Google
 ALLOWED_TELEGRAM_USER_ID=ваш_telegram_id
 OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 TIMEZONE=Europe/Moscow
+APP_VERSION=v0.5.0-sheets-headers
 ```
 
 Для сохранения в Google Sheets нужно создать сервисный аккаунт в Google Cloud,
