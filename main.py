@@ -1,10 +1,16 @@
+import base64
+import json
 import logging
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -25,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
+GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents"
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 
 
 def get_bot_token() -> str:
@@ -114,6 +122,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
+    try:
+        document_url = save_transcript_to_google_doc(transcript)
+    except RuntimeError as error:
+        logger.info("Google Docs is not configured: %s", error)
+    except Exception:
+        logger.exception("Failed to save transcript to Google Docs")
+        await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Docs.")
+    else:
+        await update.message.reply_text(f"Сохранил расшифровку в Google Docs:\n{document_url}")
 
 
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -143,6 +160,64 @@ async def transcribe_audio(audio_path: Path) -> str:
             )
             response.raise_for_status()
             return response.text.strip()
+
+
+def save_transcript_to_google_doc(transcript: str) -> str:
+    document_id = os.getenv("GOOGLE_DOC_ID")
+    if not document_id:
+        raise RuntimeError("Set GOOGLE_DOC_ID to enable Google Docs saving.")
+
+    docs_service = build_google_docs_service()
+    document = docs_service.documents().get(documentId=document_id).execute()
+    end_index = document["body"]["content"][-1]["endIndex"]
+    timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"\n\n{timestamp}\n{transcript}\n"
+
+    docs_service.documents().batchUpdate(
+        documentId=document_id,
+        body={
+            "requests": [
+                {
+                    "insertText": {
+                        "location": {"index": max(end_index - 1, 1)},
+                        "text": entry,
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+    return f"https://docs.google.com/document/d/{document_id}/edit"
+
+
+def build_google_docs_service():
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    service_account_json_base64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")
+
+    if service_account_json:
+        service_account_info = json.loads(service_account_json)
+    elif service_account_json_base64:
+        service_account_info = json.loads(base64.b64decode(service_account_json_base64))
+    else:
+        service_account_info = None
+
+    if service_account_info:
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_info,
+            scopes=[GOOGLE_DOCS_SCOPE],
+        )
+    elif credentials_path:
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=[GOOGLE_DOCS_SCOPE],
+        )
+    else:
+        raise RuntimeError(
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
+        )
+
+    return build("docs", "v1", credentials=credentials)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
