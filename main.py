@@ -123,9 +123,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
     try:
-            spreadsheet_url = save_transcript_to_google_sheet(transcript)
+        spreadsheet_url = save_transcript_to_google_sheet(transcript)
     except RuntimeError as error:
         logger.info("Google Sheets is not configured: %s", error)
+        await update.message.reply_text(
+            "Расшифровка готова, но сохранение в Google Sheets не настроено на сервере.\n\n"
+            f"Детали: {error}"
+        )
     except Exception:
         logger.exception("Failed to save transcript to Google Sheets")
         await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Sheets.")
