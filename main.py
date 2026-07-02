@@ -93,11 +93,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(str(error))
         return
     except httpx.HTTPStatusError as error:
-        logger.exception("OpenAI transcription failed")
+        openai_error = error.response.text
+        logger.exception("OpenAI transcription failed: %s", openai_error)
         await update.message.reply_text(
             "Не получилось расшифровать аудио через OpenAI. "
-            f"OpenAI вернул статус {error.response.status_code}. "
-            "Проверь ключ API и баланс, а я уже записал ошибку в логи."
+            f"OpenAI вернул статус {error.response.status_code}.\n\n"
+            f"Детали: {openai_error[:900]}"
         )
         return
     except Exception:
@@ -117,7 +118,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
     telegram_file = await context.bot.get_file(voice.file_id)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".oga") as temp_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
         audio_path = Path(temp_file.name)
 
     await telegram_file.download_to_drive(custom_path=audio_path)
@@ -138,7 +139,7 @@ async def transcribe_audio(audio_path: Path) -> str:
                     "model": TRANSCRIPTION_MODEL,
                     "response_format": "text",
                 },
-                files={"file": ("voice.oga", audio_file, "audio/ogg")},
+                files={"file": ("voice.ogg", audio_file, "audio/ogg")},
             )
             response.raise_for_status()
             return response.text.strip()
