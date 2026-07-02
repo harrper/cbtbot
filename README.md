@@ -10,7 +10,6 @@
 TELEGRAM_BOT_TOKEN=токен_из_BotFather
 OPENAI_API_KEY=ключ_OpenAI
 GOOGLE_SHEET_ID=ID_Google_Таблицы
-GOOGLE_SHEET_RANGE=необязательно_например_Лист1!A:D
 GOOGLE_SERVICE_ACCOUNT_JSON=JSON_сервисного_аккаунта_Google
 # или GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=JSON_сервисного_аккаунта_в_base64
 ```

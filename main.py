@@ -33,6 +33,19 @@ TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-trans
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+SHEET_VALUE_BY_HEADER = {
+    "дата": "timestamp",
+    "тест сообщения": "transcript",
+    "текст сообщения": "transcript",
+    "исходная расшифровка": "transcript",
+    "расшифровка": "transcript",
+    "ситуация": "situation",
+    "мысли": "thoughts",
+    "эмоции": "emotions",
+    "ощущения": "sensations",
+    "действия": "actions",
+    "дейсвия": "actions",
+}
 
 
 def get_bot_token() -> str:
@@ -172,40 +185,73 @@ def save_transcript_to_google_sheet(transcript: str) -> str:
         raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
 
     sheets_service = build_google_service("sheets", "v4")
-    sheet_range = get_google_sheet_range(sheets_service, spreadsheet_id)
+    sheet_title = get_first_sheet_title(sheets_service, spreadsheet_id)
+    headers = get_sheet_headers(sheets_service, spreadsheet_id, sheet_title)
+    append_range = f"{sheet_title}!A:{column_letter(len(headers))}"
     timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+    row = build_sheet_row(headers, transcript, timestamp)
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=sheet_range,
+        range=append_range,
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={
-            "values": [
-                [
-                    timestamp,
-                    "voice",
-                    transcript,
-                    TRANSCRIPTION_MODEL,
-                ]
-            ]
-        },
+        body={"values": [row]},
     ).execute()
 
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
 
 
-def get_google_sheet_range(sheets_service, spreadsheet_id: str) -> str:
-    configured_range = os.getenv("GOOGLE_SHEET_RANGE")
-    if configured_range:
-        return configured_range
-
+def get_first_sheet_title(sheets_service, spreadsheet_id: str) -> str:
     spreadsheet = sheets_service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
         fields="sheets.properties.title",
     ).execute()
     first_sheet_title = spreadsheet["sheets"][0]["properties"]["title"]
-    return f"{first_sheet_title}!A:D"
+    return first_sheet_title
+
+
+def get_sheet_headers(sheets_service, spreadsheet_id: str, sheet_title: str) -> list[str]:
+    values = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_title}!1:1",
+    ).execute().get("values", [])
+
+    if not values or not values[0]:
+        raise RuntimeError("Google Sheet must have headers in the first row.")
+
+    return values[0]
+
+
+def build_sheet_row(headers: list[str], transcript: str, timestamp: str) -> list[str]:
+    values = {
+        "timestamp": timestamp,
+        "transcript": transcript,
+        "situation": "",
+        "thoughts": "",
+        "emotions": "",
+        "sensations": "",
+        "actions": "",
+    }
+
+    row = []
+    for header in headers:
+        field_name = SHEET_VALUE_BY_HEADER.get(normalize_header(header), "")
+        row.append(values.get(field_name, ""))
+
+    return row
+
+
+def normalize_header(header: str) -> str:
+    return " ".join(header.strip().lower().split())
+
+
+def column_letter(column_number: int) -> str:
+    letters = ""
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters or "A"
 
 
 def build_google_service(service_name: str, version: str):
