@@ -33,7 +33,7 @@ TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-trans
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = os.getenv("APP_VERSION", "v0.7.2-corrections-and-situation")
+APP_VERSION = os.getenv("APP_VERSION", "v0.7.3-clean-single-sentence-periods")
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 SHEET_VALUE_BY_HEADER = {
@@ -314,7 +314,7 @@ async def extract_journal_entry(transcript: str) -> dict:
         response.raise_for_status()
         data = response.json()
 
-    return json.loads(extract_response_text(data))
+    return normalize_journal_entry(json.loads(extract_response_text(data)))
 
 
 def extract_response_text(response_data: dict) -> str:
@@ -324,6 +324,44 @@ def extract_response_text(response_data: dict) -> str:
                 return content_item.get("text", "")
 
     raise RuntimeError("OpenAI response did not contain output_text.")
+
+
+def normalize_journal_entry(journal_entry: dict) -> dict:
+    normalized = dict(journal_entry)
+    for field_name in (
+        "intensity",
+        "situation",
+        "thoughts",
+        "emotions",
+        "sensations",
+        "actions",
+    ):
+        value = normalized.get(field_name)
+        if isinstance(value, str):
+            normalized[field_name] = strip_final_period_from_single_sentence(value)
+
+    return normalized
+
+
+def strip_final_period_from_single_sentence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.endswith("."):
+        return stripped
+
+    without_final_period = stripped[:-1]
+    if has_sentence_ending_inside(without_final_period):
+        return stripped
+
+    return without_final_period
+
+
+def has_sentence_ending_inside(text: str) -> bool:
+    for index, char in enumerate(text):
+        if char in ".!?":
+            next_char = text[index + 1] if index + 1 < len(text) else ""
+            if not next_char or next_char.isspace():
+                return True
+    return False
 
 
 def format_journal_entry_summary(journal_entry: dict) -> str:
