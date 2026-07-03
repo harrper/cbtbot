@@ -33,7 +33,7 @@ TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-trans
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = os.getenv("APP_VERSION", "v0.7.1-allowed-user-status")
+APP_VERSION = os.getenv("APP_VERSION", "v0.7.2-corrections-and-situation")
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 SHEET_VALUE_BY_HEADER = {
@@ -236,6 +236,13 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "сказано в тексте. Если запись не описывает эмоциональное состояние, переживание, "
                             "ситуацию с эмоциями или дневниковую запись о чувствах, верни is_journal_entry=false. "
                             "Поле reason всегда пиши по-русски. "
+                            "Если пользователь в тексте сам себя исправляет или уточняет любое поле, бери "
+                            "последнюю скорректированную версию: например '1 из 10, ладно, 2 из 10' значит "
+                            "интенсивность '2 из 10'; 'слабость, хотя нет, пустота' значит 'пустота'. "
+                            "Ситуация — только фактический контекст или триггер: что произошло, где/когда, "
+                            "какое событие или телесный симптом запустил переживание. Не записывай в ситуацию "
+                            "автоматические мысли, прогнозы, оценки, выводы и интерпретации — их записывай "
+                            "в thoughts, если они прямо сказаны. "
                             "Интенсивность извлекай только если пользователь явно указал именно силу/оценку "
                             "эмоции: например '8 из 10', '70%', 'очень сильная', 'слабая', 'умеренная'. "
                             "Не записывай в интенсивность названия эмоций вроде 'тревога', 'паника', "
