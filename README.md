@@ -18,7 +18,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON=JSON_сервисного_аккаунта_Google
 
 ```text
 ALLOWED_TELEGRAM_USER_ID=ваш_telegram_id
-OPENAI_EXTRACTION_MODEL=gpt-4.1-mini
+OPENAI_EXTRACTION_MODEL=gpt-5.4
 TIMEZONE=Europe/Moscow
 ```
 

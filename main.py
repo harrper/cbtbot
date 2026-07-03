@@ -35,8 +35,8 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.8.3-chat-error-details"
-EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
+APP_VERSION = "v0.8.5-status-models"
+EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
 SHEET_VALUE_BY_HEADER = {
@@ -582,7 +582,12 @@ def format_status_message() -> str:
         if allowed_user_id
         else "ALLOWED_TELEGRAM_USER_ID не указан. Бот сейчас отвечает всем."
     )
-    return f"Версия: {APP_VERSION}\n{access_line}"
+    return (
+        f"Версия: {APP_VERSION}\n"
+        f"Модель распознавания: {TRANSCRIPTION_MODEL}\n"
+        f"Модель разбора: {EXTRACTION_MODEL}\n"
+        f"{access_line}"
+    )
 
 
 def save_transcript_to_google_sheet(transcript: str, journal_entry: dict | None = None) -> str:
