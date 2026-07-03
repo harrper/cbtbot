@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -29,13 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
+TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = os.getenv("APP_VERSION", "v0.7.3-clean-single-sentence-periods")
+APP_VERSION = "v0.8.2-russian-transcription"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+PENDING_ENTRY_KEY = "pending_journal_entry"
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
@@ -50,6 +52,22 @@ SHEET_VALUE_BY_HEADER = {
     "действия": "actions",
     "дейсвия": "actions",
 }
+JOURNAL_FIELD_LABELS = {
+    "intensity": "интенсивность",
+    "situation": "ситуация",
+    "thoughts": "мысли",
+    "emotions": "эмоции",
+    "sensations": "ощущения в теле",
+    "actions": "действия",
+}
+REQUIRED_JOURNAL_FIELDS = (
+    "intensity",
+    "situation",
+    "thoughts",
+    "emotions",
+    "sensations",
+    "actions",
+)
 
 
 def get_bot_token() -> str:
@@ -98,7 +116,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(format_status_message())
         return
 
-    await update.message.reply_text(f"Получил текст: {text}")
+    if context.user_data.get(PENDING_ENTRY_KEY):
+        await handle_clarification(update, context, text)
+        return
+
+    await process_journal_text(update, context, text, should_echo_transcript=False)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,7 +167,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Расшифровка получилась пустой. Попробуй записать чуть громче.")
         return
 
-    await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
+    if context.user_data.get(PENDING_ENTRY_KEY):
+        await update.message.reply_text(f"Расшифровка уточнения:\n\n{transcript}")
+        await handle_clarification(update, context, transcript)
+        return
+
+    await process_journal_text(update, context, transcript, should_echo_transcript=True)
+
+
+async def process_journal_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    transcript: str,
+    should_echo_transcript: bool,
+) -> None:
+    if should_echo_transcript:
+        await update.message.reply_text(f"Расшифровка:\n\n{transcript}")
 
     try:
         journal_entry = await extract_journal_entry(transcript)
@@ -172,7 +209,79 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text(format_journal_entry_summary(journal_entry))
+    missing_fields = get_missing_journal_fields(journal_entry)
+    if missing_fields:
+        context.user_data[PENDING_ENTRY_KEY] = {
+            "transcript": transcript,
+            "journal_entry": journal_entry,
+        }
+        await update.message.reply_text(format_missing_fields_message(missing_fields))
+        return
 
+    await save_journal_entry_and_report(update, transcript, journal_entry)
+
+
+async def handle_clarification(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    clarification: str,
+) -> None:
+    pending_entry = context.user_data.get(PENDING_ENTRY_KEY)
+    if not pending_entry:
+        await process_journal_text(
+            update,
+            context,
+            clarification,
+            should_echo_transcript=False,
+        )
+        return
+
+    transcript = pending_entry["transcript"]
+    journal_entry = pending_entry["journal_entry"]
+
+    if is_no_clarification_answer(clarification):
+        context.user_data.pop(PENDING_ENTRY_KEY, None)
+        await update.message.reply_text("Понял, сохраняю запись без уточнений.")
+        await save_journal_entry_and_report(update, transcript, journal_entry)
+        return
+
+    combined_transcript = (
+        f"{transcript} || Уточнение к этой же дневниковой записи: {clarification}"
+    )
+
+    try:
+        updated_entry = await extract_journal_entry(combined_transcript)
+    except httpx.HTTPStatusError as error:
+        openai_error = error.response.text
+        logger.exception("OpenAI clarification extraction failed: %s", openai_error)
+        await update.message.reply_text(
+            "Не получилось разобрать уточнение через OpenAI. "
+            f"OpenAI вернул статус {error.response.status_code}.\n\n"
+            f"Детали: {openai_error[:900]}"
+        )
+        return
+    except Exception:
+        logger.exception("Clarification extraction failed")
+        await update.message.reply_text("Не получилось разобрать уточнение.")
+        return
+
+    if not updated_entry["is_journal_entry"]:
+        await update.message.reply_text(
+            "Не получилось применить уточнение к дневниковой записи. "
+            "Попробуй написать недостающие пункты явно."
+        )
+        return
+
+    context.user_data.pop(PENDING_ENTRY_KEY, None)
+    await update.message.reply_text(format_journal_entry_summary(updated_entry))
+    await save_journal_entry_and_report(update, combined_transcript, updated_entry)
+
+
+async def save_journal_entry_and_report(
+    update: Update,
+    transcript: str,
+    journal_entry: dict,
+) -> None:
     try:
         spreadsheet_url = save_transcript_to_google_sheet(transcript, journal_entry)
     except RuntimeError as error:
@@ -185,7 +294,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("Failed to save transcript to Google Sheets")
         await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Sheets.")
     else:
-        await update.message.reply_text(f"Сохранил расшифровку в Google Sheets:\n{spreadsheet_url}")
+        await update.message.reply_text(f"Сохранил запись в Google Sheets:\n{spreadsheet_url}")
 
 
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -209,6 +318,7 @@ async def transcribe_audio(audio_path: Path) -> str:
                 headers={"Authorization": f"Bearer {api_key}"},
                 data={
                     "model": TRANSCRIPTION_MODEL,
+                    "language": "ru",
                     "response_format": "text",
                 },
                 files={"file": ("voice.ogg", audio_file, "audio/ogg")},
@@ -244,10 +354,15 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "автоматические мысли, прогнозы, оценки, выводы и интерпретации — их записывай "
                             "в thoughts, если они прямо сказаны. "
                             "Интенсивность извлекай только если пользователь явно указал именно силу/оценку "
-                            "эмоции: например '8 из 10', '70%', 'очень сильная', 'слабая', 'умеренная'. "
+                            "эмоции. Записывай intensity только числом по шкале от 0 до 10 без слов и "
+                            "без 'из 10': например '8 из 10' -> '8', '70%' -> '7', '2/10' -> '2'. "
+                            "Если оценка дана словами, переведи ее в число 0–10: слабая -> 2, "
+                            "умеренная -> 5, сильная -> 8, очень сильная -> 9. "
                             "Не записывай в интенсивность названия эмоций вроде 'тревога', 'паника', "
                             "'злость' и не делай вывод о силе по словам 'даже', 'очень испугался' или "
                             "по общему смыслу. Если явной оценки силы нет — оставь intensity пустым. "
+                            "Эмоции записывай в именительном падеже, через запятую: 'тревога', 'гнев', "
+                            "'отчаяние', а не 'тревогу', 'гнева' или 'отчаянием'. "
                             "Ощущения — только телесные реакции, которые возникли как следствие эмоций, "
                             "мыслей или переживания: например ком в горле, сжатие в груди, дрожь, жар, "
                             "напряжение, учащенное сердцебиение. Не записывай в ощущения физический симптом, "
@@ -326,6 +441,37 @@ def extract_response_text(response_data: dict) -> str:
     raise RuntimeError("OpenAI response did not contain output_text.")
 
 
+def get_missing_journal_fields(journal_entry: dict) -> list[str]:
+    return [
+        field_name
+        for field_name in REQUIRED_JOURNAL_FIELDS
+        if not str(journal_entry.get(field_name) or "").strip()
+    ]
+
+
+def format_missing_fields_message(missing_fields: list[str]) -> str:
+    field_list = ", ".join(JOURNAL_FIELD_LABELS[field] for field in missing_fields)
+    return (
+        f"Не указаны: {field_list}.\n\n"
+        "Пришли уточнение следующим сообщением. "
+        "Если уточнений не будет, напиши: уточнений не будет"
+    )
+
+
+def is_no_clarification_answer(text: str) -> bool:
+    normalized = normalize_header(text)
+    return normalized in {
+        "уточнений не будет",
+        "нет уточнений",
+        "без уточнений",
+        "не буду уточнять",
+        "не хочу уточнять",
+        "пропустить",
+        "сохрани как есть",
+        "оставь как есть",
+    }
+
+
 def normalize_journal_entry(journal_entry: dict) -> dict:
     normalized = dict(journal_entry)
     for field_name in (
@@ -340,7 +486,42 @@ def normalize_journal_entry(journal_entry: dict) -> dict:
         if isinstance(value, str):
             normalized[field_name] = strip_final_period_from_single_sentence(value)
 
+    intensity = normalized.get("intensity")
+    if isinstance(intensity, str):
+        normalized["intensity"] = normalize_intensity(intensity)
+
     return normalized
+
+
+def normalize_intensity(intensity: str) -> str:
+    value = strip_final_period_from_single_sentence(intensity)
+    if not value:
+        return ""
+
+    percent_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", value)
+    if percent_match:
+        return format_scale_number(float(percent_match.group(1).replace(",", ".")) / 10)
+
+    scale_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:из|/)\s*10",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if scale_match:
+        return format_scale_number(float(scale_match.group(1).replace(",", ".")))
+
+    plain_number_match = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*", value)
+    if plain_number_match:
+        return format_scale_number(float(plain_number_match.group(1).replace(",", ".")))
+
+    return value
+
+
+def format_scale_number(number: float) -> str:
+    bounded = max(0, min(10, number))
+    if bounded.is_integer():
+        return str(int(bounded))
+    return f"{bounded:.1f}".rstrip("0").rstrip(".")
 
 
 def strip_final_period_from_single_sentence(text: str) -> str:
