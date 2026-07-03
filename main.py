@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import tempfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,7 +35,7 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.8.2-russian-transcription"
+APP_VERSION = "v0.8.3-chat-error-details"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-4.1-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
@@ -152,12 +153,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Не получилось расшифровать аудио через OpenAI. "
             f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {openai_error[:900]}"
+            f"Детали: {sanitize_error_text(openai_error)[:900]}"
         )
         return
-    except Exception:
+    except Exception as error:
         logger.exception("Voice handling failed")
-        await update.message.reply_text("Не получилось обработать голосовое. Ошибка записана в логи.")
+        await update.message.reply_text(
+            format_error_message("Не получилось обработать голосовое.", error)
+        )
         return
     finally:
         if audio_path:
@@ -192,12 +195,17 @@ async def process_journal_text(
         await update.message.reply_text(
             "Расшифровка готова, но не получилось разобрать запись через OpenAI. "
             f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {openai_error[:900]}"
+            f"Детали: {sanitize_error_text(openai_error)[:900]}"
         )
         return
-    except Exception:
+    except Exception as error:
         logger.exception("Journal extraction failed")
-        await update.message.reply_text("Расшифровка готова, но не получилось разобрать дневниковую запись.")
+        await update.message.reply_text(
+            format_error_message(
+                "Расшифровка готова, но не получилось разобрать дневниковую запись.",
+                error,
+            )
+        )
         return
 
     if not journal_entry["is_journal_entry"]:
@@ -257,12 +265,14 @@ async def handle_clarification(
         await update.message.reply_text(
             "Не получилось разобрать уточнение через OpenAI. "
             f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {openai_error[:900]}"
+            f"Детали: {sanitize_error_text(openai_error)[:900]}"
         )
         return
-    except Exception:
+    except Exception as error:
         logger.exception("Clarification extraction failed")
-        await update.message.reply_text("Не получилось разобрать уточнение.")
+        await update.message.reply_text(
+            format_error_message("Не получилось разобрать уточнение.", error)
+        )
         return
 
     if not updated_entry["is_journal_entry"]:
@@ -290,9 +300,14 @@ async def save_journal_entry_and_report(
             "Расшифровка готова, но сохранение в Google Sheets не настроено на сервере.\n\n"
             f"Детали: {error}"
         )
-    except Exception:
+    except Exception as error:
         logger.exception("Failed to save transcript to Google Sheets")
-        await update.message.reply_text("Расшифровка готова, но не получилось сохранить ее в Google Sheets.")
+        await update.message.reply_text(
+            format_error_message(
+                "Расшифровка готова, но не получилось сохранить ее в Google Sheets.",
+                error,
+            )
+        )
     else:
         await update.message.reply_text(f"Сохранил запись в Google Sheets:\n{spreadsheet_url}")
 
@@ -682,8 +697,77 @@ def build_google_service(service_name: str, version: str):
     return build(service_name, version, credentials=credentials)
 
 
+def format_error_message(title: str, error: BaseException) -> str:
+    error_type = type(error).__name__
+    error_text = sanitize_error_text(str(error) or "(без текста ошибки)")
+    trace_text = sanitize_error_text(
+        "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    )
+    trace_tail = trace_text[-1800:]
+    message = (
+        f"{title}\n\n"
+        f"Версия: {APP_VERSION}\n"
+        f"Тип ошибки: {error_type}\n"
+        f"Текст ошибки: {error_text[:900]}\n\n"
+        f"Фрагмент traceback:\n{trace_tail}"
+    )
+    return message[:3900]
+
+
+def sanitize_error_text(text: str) -> str:
+    sanitized = text
+    for secret in get_known_secret_values():
+        if secret:
+            sanitized = sanitized.replace(secret, mask_secret(secret))
+
+    sanitized = re.sub(
+        r"\b\d{8,}:[A-Za-z0-9_-]{20,}\b",
+        "[TELEGRAM_BOT_TOKEN]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"\bsk-[A-Za-z0-9_-]{20,}\b",
+        "[OPENAI_API_KEY]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"-----BEGIN PRIVATE KEY-----.*?-----END PRIVATE KEY-----",
+        "[GOOGLE_PRIVATE_KEY]",
+        sanitized,
+        flags=re.DOTALL,
+    )
+    return sanitized
+
+
+def get_known_secret_values() -> list[str]:
+    secret_names = (
+        "TELEGRAM_BOT_TOKEN",
+        "BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64",
+    )
+    return [
+        value
+        for value in (os.getenv(secret_name) for secret_name in secret_names)
+        if value and len(value) >= 8
+    ]
+
+
+def mask_secret(secret: str) -> str:
+    if len(secret) <= 12:
+        return "[SECRET]"
+    return f"{secret[:4]}...[SECRET]...{secret[-4:]}"
+
+
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled bot error", exc_info=context.error)
+    if not isinstance(update, Update) or not update.effective_message or not context.error:
+        return
+
+    await update.effective_message.reply_text(
+        format_error_message("Произошла непойманная ошибка.", context.error)
+    )
 
 
 def main() -> None:
