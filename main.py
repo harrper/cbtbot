@@ -35,7 +35,7 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.10.1-explicit-diary-date"
+APP_VERSION = "v0.10.2-explicit-day-journal"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
@@ -354,6 +354,11 @@ async def process_day_journal_entry(
     await update.message.reply_text(format_day_journal_summary(journal_entry))
     missing_fields = get_missing_day_journal_fields(journal_entry)
     if missing_fields:
+        if is_save_as_is_request(transcript):
+            await update.message.reply_text("Понял, сохраняю дневник как есть.")
+            await save_day_journal_entry_and_report(update, transcript, journal_entry)
+            return
+
         context.user_data[PENDING_ENTRY_KEY] = {
             "entry_type": "day",
             "transcript": transcript,
@@ -491,12 +496,16 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "Если запись не является эмоциональным дневником, но пользователь описывает "
                             "события дня, бытовые дела, планы, итоги, наблюдения или обычную дневниковую "
                             "заметку без явного разбора эмоций, верни is_day_journal_entry=true. "
+                            "Если пользователь прямо говорит, что это дневниковая запись за день, "
+                            "или просит сохранить текст в дневник за день, всегда верни is_day_journal_entry=true, "
+                            "даже если текст короткий, тестовый или в нем нет событий. "
                             "Эти два типа взаимоисключающие: не возвращай true для обоих. Если человек "
                             "подводит итоги всего дня, такая запись остается дневником за день, даже если "
                             "в ней есть общая эмоциональная оценка. Считай ее КПТ-записью только когда центром "
                             "является отдельный эмоциональный эпизод и связь ситуации, мыслей, эмоций, тела или действий. "
-                            "Если это не дневниковая запись вообще, например вопрос к боту, команда, тестовая "
-                            "фраза или техническое сообщение, верни is_day_journal_entry=false. "
+                            "Если это не дневниковая запись вообще, например вопрос к боту, команда или "
+                            "техническое сообщение без просьбы сохранить его в дневник, верни "
+                            "is_day_journal_entry=false. "
                             "Поле reason всегда пиши по-русски. Поле day_journal_reason тоже пиши по-русски. "
                             "Не суммаризируй и не укорачивай содержание полей. Для situation, thoughts, "
                             "sensations и actions сохраняй формулировки пользователя максимально близко "
@@ -690,6 +699,17 @@ def is_no_clarification_answer(text: str) -> bool:
         "сохрани как есть",
         "оставь как есть",
     }
+
+
+def is_save_as_is_request(text: str) -> bool:
+    normalized = normalize_header(text).replace("ё", "е")
+    normalized = " ".join(re.sub(r"[^\w\s]", " ", normalized).split())
+    return bool(
+        re.search(
+            r"\bсохрани(?:ть)?(?:\s+ее)?(?:\s+пожалуйста)?\s+как\s+есть\b",
+            normalized,
+        )
+    )
 
 
 def normalize_journal_entry(journal_entry: dict) -> dict:
