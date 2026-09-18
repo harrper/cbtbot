@@ -35,12 +35,28 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.9.0-day-journal"
+APP_VERSION = "v0.10.1-explicit-diary-date"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
 DAY_JOURNAL_SHEET_TITLE = os.getenv("DAY_JOURNAL_SHEET_TITLE", "Дневник за день")
-DAY_JOURNAL_HEADERS = ("Дата", "Текст сообщения")
+DAY_JOURNAL_HEADERS = (
+    "Дата",
+    "Текст сообщения",
+    "День",
+    "Краткое содержание",
+    "Эмоциональное состояние",
+    "Время отхода ко сну",
+    "Время пробуждения",
+    "Время сна, часов",
+)
+DAY_JOURNAL_FIELD_LABELS = {
+    "diary_date": "день, за который записан дневник",
+    "emotional_state": "эмоциональную оценку дня",
+    "woke_up_at": "время подъёма",
+    "went_to_bed_at": "время отхода ко сну",
+}
+REQUIRED_DAY_JOURNAL_FIELDS = tuple(DAY_JOURNAL_FIELD_LABELS)
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
@@ -212,7 +228,7 @@ async def process_journal_text(
 
     if not journal_entry["is_journal_entry"]:
         if journal_entry.get("is_day_journal_entry"):
-            await save_day_journal_entry_and_report(update, transcript)
+            await process_day_journal_entry(update, context, transcript, journal_entry)
             return
 
         reason = journal_entry.get("reason") or "не является дневниковой записью об эмоциях"
@@ -226,6 +242,7 @@ async def process_journal_text(
     missing_fields = get_missing_journal_fields(journal_entry)
     if missing_fields:
         context.user_data[PENDING_ENTRY_KEY] = {
+            "entry_type": "cbt",
             "transcript": transcript,
             "journal_entry": journal_entry,
         }
@@ -252,6 +269,16 @@ async def handle_clarification(
 
     transcript = pending_entry["transcript"]
     journal_entry = pending_entry["journal_entry"]
+
+    if pending_entry.get("entry_type") == "day":
+        await handle_day_journal_clarification(
+            update,
+            context,
+            transcript,
+            journal_entry,
+            clarification,
+        )
+        return
 
     if is_no_clarification_answer(clarification):
         context.user_data.pop(PENDING_ENTRY_KEY, None)
@@ -318,9 +345,79 @@ async def save_journal_entry_and_report(
         await update.message.reply_text(f"Сохранил запись в Google Sheets:\n{spreadsheet_url}")
 
 
-async def save_day_journal_entry_and_report(update: Update, transcript: str) -> None:
+async def process_day_journal_entry(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    transcript: str,
+    journal_entry: dict,
+) -> None:
+    await update.message.reply_text(format_day_journal_summary(journal_entry))
+    missing_fields = get_missing_day_journal_fields(journal_entry)
+    if missing_fields:
+        context.user_data[PENDING_ENTRY_KEY] = {
+            "entry_type": "day",
+            "transcript": transcript,
+            "journal_entry": journal_entry,
+        }
+        await update.message.reply_text(format_missing_day_journal_fields(missing_fields))
+        return
+
+    await save_day_journal_entry_and_report(update, transcript, journal_entry)
+
+
+async def handle_day_journal_clarification(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    transcript: str,
+    journal_entry: dict,
+    clarification: str,
+) -> None:
+    if is_no_clarification_answer(clarification):
+        context.user_data.pop(PENDING_ENTRY_KEY, None)
+        await update.message.reply_text("Понял, сохраняю дневник без уточнений.")
+        await save_day_journal_entry_and_report(update, transcript, journal_entry)
+        return
+
+    combined_transcript = (
+        f"{transcript} || Уточнение к этой же записи за день: {clarification}"
+    )
     try:
-        spreadsheet_url = save_day_journal_to_google_sheet(transcript)
+        updated_entry = await extract_journal_entry(combined_transcript)
+    except httpx.HTTPStatusError as error:
+        openai_error = error.response.text
+        logger.exception("OpenAI day journal clarification failed: %s", openai_error)
+        await update.message.reply_text(
+            "Не получилось разобрать уточнение через OpenAI. "
+            f"OpenAI вернул статус {error.response.status_code}.\n\n"
+            f"Детали: {sanitize_error_text(openai_error)[:900]}"
+        )
+        return
+    except Exception as error:
+        logger.exception("Day journal clarification extraction failed")
+        await update.message.reply_text(
+            format_error_message("Не получилось разобрать уточнение.", error)
+        )
+        return
+
+    if not updated_entry.get("is_day_journal_entry"):
+        await update.message.reply_text(
+            "Не получилось применить уточнение. "
+            "Попробуй явно указать оценку дня и время сна."
+        )
+        return
+
+    context.user_data.pop(PENDING_ENTRY_KEY, None)
+    await update.message.reply_text(format_day_journal_summary(updated_entry))
+    await save_day_journal_entry_and_report(update, combined_transcript, updated_entry)
+
+
+async def save_day_journal_entry_and_report(
+    update: Update,
+    transcript: str,
+    journal_entry: dict,
+) -> None:
+    try:
+        spreadsheet_url = save_day_journal_to_google_sheet(transcript, journal_entry)
     except RuntimeError as error:
         logger.info("Google Sheets is not configured: %s", error)
         await update.message.reply_text(
@@ -376,6 +473,8 @@ async def extract_journal_entry(transcript: str) -> dict:
     if not api_key:
         raise RuntimeError("Set OPENAI_API_KEY in environment variables.")
 
+    now = datetime.now(ZoneInfo(TIMEZONE))
+
     payload = {
         "model": EXTRACTION_MODEL,
         "input": [
@@ -392,6 +491,10 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "Если запись не является эмоциональным дневником, но пользователь описывает "
                             "события дня, бытовые дела, планы, итоги, наблюдения или обычную дневниковую "
                             "заметку без явного разбора эмоций, верни is_day_journal_entry=true. "
+                            "Эти два типа взаимоисключающие: не возвращай true для обоих. Если человек "
+                            "подводит итоги всего дня, такая запись остается дневником за день, даже если "
+                            "в ней есть общая эмоциональная оценка. Считай ее КПТ-записью только когда центром "
+                            "является отдельный эмоциональный эпизод и связь ситуации, мыслей, эмоций, тела или действий. "
                             "Если это не дневниковая запись вообще, например вопрос к боту, команда, тестовая "
                             "фраза или техническое сообщение, верни is_day_journal_entry=false. "
                             "Поле reason всегда пиши по-русски. Поле day_journal_reason тоже пиши по-русски. "
@@ -434,7 +537,26 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "который запустил переживание: например 'включил стрим', 'увидел фото', "
                             "'прочитал сообщение', 'встретил человека' обычно относятся к ситуации, "
                             "если пользователь не говорит, что сделал это уже как реакцию на переживание. "
-                            "Если действий после переживания или планируемых действий нет — оставь actions пустым."
+                            "Если действий после переживания или планируемых действий нет — оставь actions пустым. "
+                            "Для дневника за день также извлекай diary_date, short_summary, "
+                            "emotional_state, woke_up_at, went_to_bed_at и sleep_duration_hours. "
+                            "diary_date — календарный "
+                            "день, за который подводятся итоги, в формате YYYY-MM-DD. Явно названная "
+                            "пользователем дата может быть конкретной датой или словами "
+                            "'сегодня', 'вчера', 'позавчера'. Если день не назван явно, оставь "
+                            "diary_date пустым: не выбирай дату по времени сообщения или контексту. "
+                            f"Текущие местные дата и время для разрешения слов 'сегодня' и 'вчера': "
+                            f"{now.strftime('%Y-%m-%d %H:%M:%S')} ({TIMEZONE}). "
+                            "short_summary — нейтральное краткое содержание дня ровно в трех-четырех "
+                            "словах, без домыслов. emotional_state — прямо высказанная пользователем "
+                            "общая эмоциональная оценка дня; сохраняй ее близко к тексту и не выводи "
+                            "из событий. woke_up_at и went_to_bed_at — только явно названные времена, "
+                            "предпочтительно HH:MM; если их нет, оставь поля пустыми. "
+                            "sleep_duration_hours — длительность сна в часах, только число. Если она названа "
+                            "явно, используй ее; иначе рассчитай по времени отхода ко сну и пробуждения, "
+                            "учитывая переход через полночь. Не считай время "
+                            "отправки сообщения временем подъема или отхода ко сну. Для записей не из "
+                            "дневника за день оставь все шесть полей пустыми."
                         ),
                     }
                 ],
@@ -468,6 +590,12 @@ async def extract_journal_entry(transcript: str) -> dict:
                         "emotions": {"type": "string"},
                         "sensations": {"type": "string"},
                         "actions": {"type": "string"},
+                        "diary_date": {"type": "string"},
+                        "short_summary": {"type": "string"},
+                        "emotional_state": {"type": "string"},
+                        "woke_up_at": {"type": "string"},
+                        "went_to_bed_at": {"type": "string"},
+                        "sleep_duration_hours": {"type": "string"},
                     },
                     "required": [
                         "is_journal_entry",
@@ -480,6 +608,12 @@ async def extract_journal_entry(transcript: str) -> dict:
                         "emotions",
                         "sensations",
                         "actions",
+                        "diary_date",
+                        "short_summary",
+                        "emotional_state",
+                        "woke_up_at",
+                        "went_to_bed_at",
+                        "sleep_duration_hours",
                     ],
                 },
             }
@@ -518,6 +652,23 @@ def get_missing_journal_fields(journal_entry: dict) -> list[str]:
     ]
 
 
+def get_missing_day_journal_fields(journal_entry: dict) -> list[str]:
+    return [
+        field_name
+        for field_name in REQUIRED_DAY_JOURNAL_FIELDS
+        if not str(journal_entry.get(field_name) or "").strip()
+    ]
+
+
+def format_missing_day_journal_fields(missing_fields: list[str]) -> str:
+    field_list = ", ".join(DAY_JOURNAL_FIELD_LABELS[field] for field in missing_fields)
+    return (
+        f"Не указаны: {field_list}.\n\n"
+        "Пришли их следующим сообщением. "
+        "Если уточнять не хочешь, напиши: уточнений не будет"
+    )
+
+
 def format_missing_fields_message(missing_fields: list[str]) -> str:
     field_list = ", ".join(JOURNAL_FIELD_LABELS[field] for field in missing_fields)
     return (
@@ -550,6 +701,11 @@ def normalize_journal_entry(journal_entry: dict) -> dict:
         "emotions",
         "sensations",
         "actions",
+        "short_summary",
+        "emotional_state",
+        "woke_up_at",
+        "went_to_bed_at",
+        "sleep_duration_hours",
     ):
         value = normalized.get(field_name)
         if isinstance(value, str):
@@ -559,7 +715,41 @@ def normalize_journal_entry(journal_entry: dict) -> dict:
     if isinstance(intensity, str):
         normalized["intensity"] = normalize_intensity(intensity)
 
+    calculated_sleep_duration = calculate_sleep_duration_hours(
+        normalized.get("went_to_bed_at", ""),
+        normalized.get("woke_up_at", ""),
+    )
+    if calculated_sleep_duration:
+        normalized["sleep_duration_hours"] = calculated_sleep_duration
+
     return normalized
+
+
+def calculate_sleep_duration_hours(went_to_bed_at: str, woke_up_at: str) -> str:
+    bedtime = parse_clock_time(went_to_bed_at)
+    wake_time = parse_clock_time(woke_up_at)
+    if bedtime is None or wake_time is None:
+        return ""
+
+    duration_minutes = (wake_time - bedtime) % (24 * 60)
+    if duration_minutes == 0:
+        return ""
+    duration_hours = duration_minutes / 60
+    if duration_hours.is_integer():
+        return str(int(duration_hours))
+    return f"{duration_hours:.2f}".rstrip("0").rstrip(".")
+
+
+def parse_clock_time(value: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*", value or "")
+    if not match:
+        return None
+
+    hours = int(match.group(1))
+    minutes = int(match.group(2) or 0)
+    if hours > 23 or minutes > 59:
+        return None
+    return hours * 60 + minutes
 
 
 def normalize_intensity(intensity: str) -> str:
@@ -629,6 +819,21 @@ def format_journal_entry_summary(journal_entry: dict) -> str:
     )
 
 
+def format_day_journal_summary(journal_entry: dict) -> str:
+    def value(field_name: str) -> str:
+        return journal_entry.get(field_name) or "не указано"
+
+    return (
+        "Дневник за день:\n\n"
+        f"День: {value('diary_date')}\n"
+        f"Кратко: {value('short_summary')}\n"
+        f"Эмоциональное состояние: {value('emotional_state')}\n"
+        f"Встал: {value('woke_up_at')}\n"
+        f"Лёг: {value('went_to_bed_at')}\n"
+        f"Время сна: {value('sleep_duration_hours')} ч."
+    )
+
+
 def format_status_message() -> str:
     allowed_user_id = os.getenv("ALLOWED_TELEGRAM_USER_ID")
     access_line = (
@@ -668,7 +873,7 @@ def save_transcript_to_google_sheet(transcript: str, journal_entry: dict | None 
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
 
 
-def save_day_journal_to_google_sheet(transcript: str) -> str:
+def save_day_journal_to_google_sheet(transcript: str, journal_entry: dict) -> str:
     spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
     if not spreadsheet_id:
         raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
@@ -684,10 +889,21 @@ def save_day_journal_to_google_sheet(transcript: str) -> str:
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=f"'{DAY_JOURNAL_SHEET_TITLE}'!A:B",
+        range=f"'{DAY_JOURNAL_SHEET_TITLE}'!A:H",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [[timestamp, transcript]]},
+        body={
+            "values": [[
+                timestamp,
+                transcript,
+                journal_entry.get("diary_date", ""),
+                journal_entry.get("short_summary", ""),
+                journal_entry.get("emotional_state", ""),
+                journal_entry.get("went_to_bed_at", ""),
+                journal_entry.get("woke_up_at", ""),
+                journal_entry.get("sleep_duration_hours", ""),
+            ]]
+        },
     ).execute()
 
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
