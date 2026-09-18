@@ -35,10 +35,12 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.8.7-preserve-verbatim-fields"
+APP_VERSION = "v0.9.0-day-journal"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
+DAY_JOURNAL_SHEET_TITLE = os.getenv("DAY_JOURNAL_SHEET_TITLE", "Дневник за день")
+DAY_JOURNAL_HEADERS = ("Дата", "Текст сообщения")
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
@@ -209,6 +211,10 @@ async def process_journal_text(
         return
 
     if not journal_entry["is_journal_entry"]:
+        if journal_entry.get("is_day_journal_entry"):
+            await save_day_journal_entry_and_report(update, transcript)
+            return
+
         reason = journal_entry.get("reason") or "не является дневниковой записью об эмоциях"
         await update.message.reply_text(
             "Запись не может быть обработана, потому что не является дневниковой записью об эмоциях.\n\n"
@@ -312,6 +318,29 @@ async def save_journal_entry_and_report(
         await update.message.reply_text(f"Сохранил запись в Google Sheets:\n{spreadsheet_url}")
 
 
+async def save_day_journal_entry_and_report(update: Update, transcript: str) -> None:
+    try:
+        spreadsheet_url = save_day_journal_to_google_sheet(transcript)
+    except RuntimeError as error:
+        logger.info("Google Sheets is not configured: %s", error)
+        await update.message.reply_text(
+            "Запись похожа на дневник за день, но сохранение в Google Sheets не настроено на сервере.\n\n"
+            f"Детали: {error}"
+        )
+    except Exception as error:
+        logger.exception("Failed to save day journal to Google Sheets")
+        await update.message.reply_text(
+            format_error_message(
+                "Запись похожа на дневник за день, но не получилось сохранить ее в Google Sheets.",
+                error,
+            )
+        )
+    else:
+        await update.message.reply_text(
+            f"Сохранил запись в дневник за день:\n{spreadsheet_url}"
+        )
+
+
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
     telegram_file = await context.bot.get_file(voice.file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
@@ -360,7 +389,12 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "Ничего не додумывай и не интерпретируй. Заполняй поле только если это прямо "
                             "сказано в тексте. Если запись не описывает эмоциональное состояние, переживание, "
                             "ситуацию с эмоциями или дневниковую запись о чувствах, верни is_journal_entry=false. "
-                            "Поле reason всегда пиши по-русски. "
+                            "Если запись не является эмоциональным дневником, но пользователь описывает "
+                            "события дня, бытовые дела, планы, итоги, наблюдения или обычную дневниковую "
+                            "заметку без явного разбора эмоций, верни is_day_journal_entry=true. "
+                            "Если это не дневниковая запись вообще, например вопрос к боту, команда, тестовая "
+                            "фраза или техническое сообщение, верни is_day_journal_entry=false. "
+                            "Поле reason всегда пиши по-русски. Поле day_journal_reason тоже пиши по-русски. "
                             "Не суммаризируй и не укорачивай содержание полей. Для situation, thoughts, "
                             "sensations и actions сохраняй формулировки пользователя максимально близко "
                             "к исходному тексту: почти цитатами, с теми же смысловыми звеньями и деталями. "
@@ -425,7 +459,9 @@ async def extract_journal_entry(transcript: str) -> dict:
                     "additionalProperties": False,
                     "properties": {
                         "is_journal_entry": {"type": "boolean"},
+                        "is_day_journal_entry": {"type": "boolean"},
                         "reason": {"type": "string"},
+                        "day_journal_reason": {"type": "string"},
                         "intensity": {"type": "string"},
                         "situation": {"type": "string"},
                         "thoughts": {"type": "string"},
@@ -435,7 +471,9 @@ async def extract_journal_entry(transcript: str) -> dict:
                     },
                     "required": [
                         "is_journal_entry",
+                        "is_day_journal_entry",
                         "reason",
+                        "day_journal_reason",
                         "intensity",
                         "situation",
                         "thoughts",
@@ -602,6 +640,7 @@ def format_status_message() -> str:
         f"Версия: {APP_VERSION}\n"
         f"Модель распознавания: {TRANSCRIPTION_MODEL}\n"
         f"Модель разбора: {EXTRACTION_MODEL}\n"
+        f"Лист дневника за день: {DAY_JOURNAL_SHEET_TITLE}\n"
         f"{access_line}"
     )
 
@@ -629,6 +668,69 @@ def save_transcript_to_google_sheet(transcript: str, journal_entry: dict | None 
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
 
 
+def save_day_journal_to_google_sheet(transcript: str) -> str:
+    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
+
+    sheets_service = build_google_service("sheets", "v4")
+    ensure_sheet_with_headers(
+        sheets_service,
+        spreadsheet_id,
+        DAY_JOURNAL_SHEET_TITLE,
+        DAY_JOURNAL_HEADERS,
+    )
+    timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{DAY_JOURNAL_SHEET_TITLE}'!A:B",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[timestamp, transcript]]},
+    ).execute()
+
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+
+def ensure_sheet_with_headers(
+    sheets_service,
+    spreadsheet_id: str,
+    sheet_title: str,
+    headers: tuple[str, ...],
+) -> None:
+    sheet_titles = get_sheet_titles(sheets_service, spreadsheet_id)
+    if sheet_title not in sheet_titles:
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": sheet_title,
+                            }
+                        }
+                    }
+                ]
+            },
+        ).execute()
+
+    existing_headers = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_title}'!1:1",
+    ).execute().get("values", [])
+    if existing_headers and existing_headers[0][: len(headers)] == list(headers):
+        return
+
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_title}'!A1:{column_letter(len(headers))}1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [list(headers)]},
+    ).execute()
+
+
 def get_first_sheet_title(sheets_service, spreadsheet_id: str) -> str:
     spreadsheet = sheets_service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
@@ -636,6 +738,17 @@ def get_first_sheet_title(sheets_service, spreadsheet_id: str) -> str:
     ).execute()
     first_sheet_title = spreadsheet["sheets"][0]["properties"]["title"]
     return first_sheet_title
+
+
+def get_sheet_titles(sheets_service, spreadsheet_id: str) -> set[str]:
+    spreadsheet = sheets_service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets.properties.title",
+    ).execute()
+    return {
+        sheet["properties"]["title"]
+        for sheet in spreadsheet.get("sheets", [])
+    }
 
 
 def get_sheet_headers(sheets_service, spreadsheet_id: str, sheet_title: str) -> list[str]:

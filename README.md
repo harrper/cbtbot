@@ -20,6 +20,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON=JSON_сервисного_аккаунта_Google
 ALLOWED_TELEGRAM_USER_ID=ваш_telegram_id
 OPENAI_EXTRACTION_MODEL=gpt-5.4
 TIMEZONE=Europe/Moscow
+DAY_JOURNAL_SHEET_TITLE=Дневник за день
 ```
 
 Для сохранения в Google Sheets нужно создать сервисный аккаунт в Google Cloud,
