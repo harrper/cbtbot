@@ -35,11 +35,12 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.10.1-explicit-diary-date"
+APP_VERSION = "v0.11.0-notes"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
 DAY_JOURNAL_SHEET_TITLE = os.getenv("DAY_JOURNAL_SHEET_TITLE", "Дневник за день")
+NOTES_SHEET_TITLE = os.getenv("NOTES_SHEET_TITLE", "Заметки")
 DAY_JOURNAL_HEADERS = (
     "Дата",
     "Текст сообщения",
@@ -57,6 +58,9 @@ DAY_JOURNAL_FIELD_LABELS = {
     "went_to_bed_at": "время отхода ко сну",
 }
 REQUIRED_DAY_JOURNAL_FIELDS = tuple(DAY_JOURNAL_FIELD_LABELS)
+NOTES_HEADERS = ("Дата", "Текст сообщения", "День", "Тип заметки")
+FREE_NOTE_TYPE = "Свободная заметка"
+CHESS_NOTE_TYPE = "Отчёт о шахматной партии"
 SHEET_VALUE_BY_HEADER = {
     "дата": "timestamp",
     "тест сообщения": "transcript",
@@ -229,6 +233,10 @@ async def process_journal_text(
     if not journal_entry["is_journal_entry"]:
         if journal_entry.get("is_day_journal_entry"):
             await process_day_journal_entry(update, context, transcript, journal_entry)
+            return
+
+        if journal_entry.get("is_note_entry"):
+            await save_note_entry_and_report(update, transcript, journal_entry)
             return
 
         reason = journal_entry.get("reason") or "не является дневниковой записью об эмоциях"
@@ -438,6 +446,37 @@ async def save_day_journal_entry_and_report(
         )
 
 
+async def save_note_entry_and_report(
+    update: Update,
+    transcript: str,
+    journal_entry: dict,
+) -> None:
+    try:
+        spreadsheet_url = save_note_to_google_sheet(transcript, journal_entry)
+    except RuntimeError as error:
+        logger.info("Google Sheets is not configured: %s", error)
+        await update.message.reply_text(
+            "Заметка распознана, но сохранение в Google Sheets не настроено.\n\n"
+            f"Детали: {error}"
+        )
+    except Exception as error:
+        logger.exception("Failed to save note to Google Sheets")
+        await update.message.reply_text(
+            format_error_message(
+                "Заметка распознана, но не получилось сохранить ее в Google Sheets.",
+                error,
+            )
+        )
+    else:
+        note_type = journal_entry.get("note_type") or FREE_NOTE_TYPE
+        await update.message.reply_text(
+            f"Сохранил заметку.\n"
+            f"Тип: {note_type}\n"
+            f"День: {journal_entry.get('note_day') or 'не указан'}\n"
+            f"{spreadsheet_url}"
+        )
+
+
 async def download_voice_message(voice, context: ContextTypes.DEFAULT_TYPE) -> Path:
     telegram_file = await context.bot.get_file(voice.file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
@@ -491,13 +530,17 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "Если запись не является эмоциональным дневником, но пользователь описывает "
                             "события дня, бытовые дела, планы, итоги, наблюдения или обычную дневниковую "
                             "заметку без явного разбора эмоций, верни is_day_journal_entry=true. "
-                            "Эти два типа взаимоисключающие: не возвращай true для обоих. Если человек "
+                            "Если запись не подводит итоги дня и не является КПТ-записью, но содержит "
+                            "факт, наблюдение, идею, описание отдельного текущего события или прямую просьбу "
+                            "сохранить заметку, верни is_note_entry=true. Отчет об одной сыгранной шахматной партии "
+                            "тоже является заметкой. Три типа взаимоисключающие: только одно из полей is_journal_entry, "
+                            "is_day_journal_entry и is_note_entry может быть true. Если человек "
                             "подводит итоги всего дня, такая запись остается дневником за день, даже если "
                             "в ней есть общая эмоциональная оценка. Считай ее КПТ-записью только когда центром "
                             "является отдельный эмоциональный эпизод и связь ситуации, мыслей, эмоций, тела или действий. "
                             "Если это не дневниковая запись вообще, например вопрос к боту, команда, тестовая "
-                            "фраза или техническое сообщение, верни is_day_journal_entry=false. "
-                            "Поле reason всегда пиши по-русски. Поле day_journal_reason тоже пиши по-русски. "
+                            "фраза или техническое сообщение, верни is_day_journal_entry=false и is_note_entry=false. "
+                            "Поля reason, day_journal_reason и note_reason всегда пиши по-русски. "
                             "Не суммаризируй и не укорачивай содержание полей. Для situation, thoughts, "
                             "sensations и actions сохраняй формулировки пользователя максимально близко "
                             "к исходному тексту: почти цитатами, с теми же смысловыми звеньями и деталями. "
@@ -557,6 +600,12 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "учитывая переход через полночь. Не считай время "
                             "отправки сообщения временем подъема или отхода ко сну. Для записей не из "
                             "дневника за день оставь все шесть полей пустыми."
+                            " Для заметки заполни note_day в формате YYYY-MM-DD. Если в тексте явно назван "
+                            "другой день, используй его; иначе используй текущий день "
+                            f"{now.date().isoformat()}. note_type должен быть ровно 'Свободная заметка' или "
+                            "'Отчёт о шахматной партии'. Второй тип выбирай только для отчета о конкретной "
+                            "шахматной партии, во всех остальных случаях выбирай 'Свободная заметка'. "
+                            "Для не-заметок оставь note_day и note_type пустыми."
                         ),
                     }
                 ],
@@ -582,8 +631,10 @@ async def extract_journal_entry(transcript: str) -> dict:
                     "properties": {
                         "is_journal_entry": {"type": "boolean"},
                         "is_day_journal_entry": {"type": "boolean"},
+                        "is_note_entry": {"type": "boolean"},
                         "reason": {"type": "string"},
                         "day_journal_reason": {"type": "string"},
+                        "note_reason": {"type": "string"},
                         "intensity": {"type": "string"},
                         "situation": {"type": "string"},
                         "thoughts": {"type": "string"},
@@ -596,12 +647,16 @@ async def extract_journal_entry(transcript: str) -> dict:
                         "woke_up_at": {"type": "string"},
                         "went_to_bed_at": {"type": "string"},
                         "sleep_duration_hours": {"type": "string"},
+                        "note_day": {"type": "string"},
+                        "note_type": {"type": "string"},
                     },
                     "required": [
                         "is_journal_entry",
                         "is_day_journal_entry",
+                        "is_note_entry",
                         "reason",
                         "day_journal_reason",
+                        "note_reason",
                         "intensity",
                         "situation",
                         "thoughts",
@@ -614,6 +669,8 @@ async def extract_journal_entry(transcript: str) -> dict:
                         "woke_up_at",
                         "went_to_bed_at",
                         "sleep_duration_hours",
+                        "note_day",
+                        "note_type",
                     ],
                 },
             }
@@ -722,7 +779,17 @@ def normalize_journal_entry(journal_entry: dict) -> dict:
     if calculated_sleep_duration:
         normalized["sleep_duration_hours"] = calculated_sleep_duration
 
+    if normalized.get("is_note_entry"):
+        normalized["note_type"] = normalize_note_type(normalized.get("note_type", ""))
+
     return normalized
+
+
+def normalize_note_type(note_type: str) -> str:
+    normalized = normalize_header(note_type).replace("ё", "е")
+    if "шахмат" in normalized:
+        return CHESS_NOTE_TYPE
+    return FREE_NOTE_TYPE
 
 
 def calculate_sleep_duration_hours(went_to_bed_at: str, woke_up_at: str) -> str:
@@ -846,6 +913,7 @@ def format_status_message() -> str:
         f"Модель распознавания: {TRANSCRIPTION_MODEL}\n"
         f"Модель разбора: {EXTRACTION_MODEL}\n"
         f"Лист дневника за день: {DAY_JOURNAL_SHEET_TITLE}\n"
+        f"Лист заметок: {NOTES_SHEET_TITLE}\n"
         f"{access_line}"
     )
 
@@ -902,6 +970,38 @@ def save_day_journal_to_google_sheet(transcript: str, journal_entry: dict) -> st
                 journal_entry.get("went_to_bed_at", ""),
                 journal_entry.get("woke_up_at", ""),
                 journal_entry.get("sleep_duration_hours", ""),
+            ]]
+        },
+    ).execute()
+
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+
+def save_note_to_google_sheet(transcript: str, journal_entry: dict) -> str:
+    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Set GOOGLE_SHEET_ID to enable Google Sheets saving.")
+
+    sheets_service = build_google_service("sheets", "v4")
+    ensure_sheet_with_headers(
+        sheets_service,
+        spreadsheet_id,
+        NOTES_SHEET_TITLE,
+        NOTES_HEADERS,
+    )
+    timestamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{NOTES_SHEET_TITLE}'!A:D",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [[
+                timestamp,
+                transcript,
+                journal_entry.get("note_day", ""),
+                normalize_note_type(journal_entry.get("note_type", "")),
             ]]
         },
     ).execute()
