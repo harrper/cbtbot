@@ -35,7 +35,7 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.11.0-notes"
+APP_VERSION = "v0.11.1-reliable-notes"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
@@ -229,6 +229,8 @@ async def process_journal_text(
             )
         )
         return
+
+    journal_entry = apply_explicit_note_intent(journal_entry, transcript)
 
     if not journal_entry["is_journal_entry"]:
         if journal_entry.get("is_day_journal_entry"):
@@ -538,7 +540,9 @@ async def extract_journal_entry(transcript: str) -> dict:
                             "подводит итоги всего дня, такая запись остается дневником за день, даже если "
                             "в ней есть общая эмоциональная оценка. Считай ее КПТ-записью только когда центром "
                             "является отдельный эмоциональный эпизод и связь ситуации, мыслей, эмоций, тела или действий. "
-                            "Если это не дневниковая запись вообще, например вопрос к боту, команда, тестовая "
+                            "Явная просьба сохранить или записать заметку всегда важнее общего правила "
+                            "о командах. Если это не дневниковая запись и не заметка вообще, например вопрос к боту, "
+                            "команда, тестовая "
                             "фраза или техническое сообщение, верни is_day_journal_entry=false и is_note_entry=false. "
                             "Поля reason, day_journal_reason и note_reason всегда пиши по-русски. "
                             "Не суммаризируй и не укорачивай содержание полей. Для situation, thoughts, "
@@ -783,6 +787,46 @@ def normalize_journal_entry(journal_entry: dict) -> dict:
         normalized["note_type"] = normalize_note_type(normalized.get("note_type", ""))
 
     return normalized
+
+
+def apply_explicit_note_intent(journal_entry: dict, transcript: str) -> dict:
+    if not has_explicit_note_intent(transcript):
+        return journal_entry
+
+    normalized = dict(journal_entry)
+    normalized["is_journal_entry"] = False
+    normalized["is_day_journal_entry"] = False
+    normalized["is_note_entry"] = True
+    normalized["note_day"] = (
+        normalized.get("note_day")
+        or datetime.now(ZoneInfo(TIMEZONE)).date().isoformat()
+    )
+    normalized["note_type"] = normalize_note_type(
+        CHESS_NOTE_TYPE if is_chess_note(transcript) else FREE_NOTE_TYPE
+    )
+    return normalized
+
+
+def has_explicit_note_intent(text: str) -> bool:
+    normalized = normalize_note_command_text(text)
+    patterns = (
+        r"^(?:это\s+)?(?:свободная\s+)?заметка\b",
+        r"\bсохрани(?:ть)?\b.{0,40}\bзаметк\w*",
+        r"\bзапиши\b.{0,40}\bзаметк\w*",
+        r"\bсоздай\b.{0,40}\bзаметк\w*",
+        r"\bотчет\s+о\s+шахматной\s+партии\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def is_chess_note(text: str) -> bool:
+    normalized = normalize_note_command_text(text)
+    return bool(re.search(r"\bотчет\s+о\s+шахматной\s+партии\b", normalized))
+
+
+def normalize_note_command_text(text: str) -> str:
+    normalized = normalize_header(text).replace("ё", "е")
+    return " ".join(re.sub(r"[^\w\s]", " ", normalized).split())
 
 
 def normalize_note_type(note_type: str) -> str:
