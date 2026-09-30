@@ -35,7 +35,7 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-APP_VERSION = "v0.11.1-reliable-notes"
+APP_VERSION = "v0.11.2-region-diagnostics"
 EXTRACTION_MODEL = os.getenv("OPENAI_EXTRACTION_MODEL", "gpt-5.4")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 PENDING_ENTRY_KEY = "pending_journal_entry"
@@ -173,9 +173,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         openai_error = error.response.text
         logger.exception("OpenAI transcription failed: %s", openai_error)
         await update.message.reply_text(
-            "Не получилось расшифровать аудио через OpenAI. "
-            f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {sanitize_error_text(openai_error)[:900]}"
+            format_openai_http_error(
+                "Не получилось расшифровать аудио через OpenAI.", error
+            )
         )
         return
     except Exception as error:
@@ -215,9 +215,10 @@ async def process_journal_text(
         openai_error = error.response.text
         logger.exception("OpenAI extraction failed: %s", openai_error)
         await update.message.reply_text(
-            "Расшифровка готова, но не получилось разобрать запись через OpenAI. "
-            f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {sanitize_error_text(openai_error)[:900]}"
+            format_openai_http_error(
+                "Расшифровка готова, но не получилось разобрать запись через OpenAI.",
+                error,
+            )
         )
         return
     except Exception as error:
@@ -306,9 +307,9 @@ async def handle_clarification(
         openai_error = error.response.text
         logger.exception("OpenAI clarification extraction failed: %s", openai_error)
         await update.message.reply_text(
-            "Не получилось разобрать уточнение через OpenAI. "
-            f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {sanitize_error_text(openai_error)[:900]}"
+            format_openai_http_error(
+                "Не получилось разобрать уточнение через OpenAI.", error
+            )
         )
         return
     except Exception as error:
@@ -397,9 +398,9 @@ async def handle_day_journal_clarification(
         openai_error = error.response.text
         logger.exception("OpenAI day journal clarification failed: %s", openai_error)
         await update.message.reply_text(
-            "Не получилось разобрать уточнение через OpenAI. "
-            f"OpenAI вернул статус {error.response.status_code}.\n\n"
-            f"Детали: {sanitize_error_text(openai_error)[:900]}"
+            format_openai_http_error(
+                "Не получилось разобрать уточнение через OpenAI.", error
+            )
         )
         return
     except Exception as error:
@@ -958,6 +959,8 @@ def format_status_message() -> str:
         f"Модель разбора: {EXTRACTION_MODEL}\n"
         f"Лист дневника за день: {DAY_JOURNAL_SHEET_TITLE}\n"
         f"Лист заметок: {NOTES_SHEET_TITLE}\n"
+        f"Регион Railway: {get_railway_region()}\n"
+        f"Коммит Railway: {get_railway_commit()}\n"
         f"{access_line}"
     )
 
@@ -1204,6 +1207,37 @@ def format_error_message(title: str, error: BaseException) -> str:
         f"Тип ошибки: {error_type}\n"
         f"Текст ошибки: {error_text[:900]}\n\n"
         f"Фрагмент traceback:\n{trace_tail}"
+    )
+    return message[:3900]
+
+
+def get_railway_region() -> str:
+    return os.getenv("RAILWAY_REPLICA_REGION") or "не определён (возможно, локальный запуск)"
+
+
+def get_railway_commit() -> str:
+    commit = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    return commit[:8] if commit else "не определён"
+
+
+def format_openai_http_error(title: str, error: httpx.HTTPStatusError) -> str:
+    status_code = error.response.status_code
+    detail = sanitize_error_text(error.response.text or str(error))[:900]
+    region_hint = ""
+    if status_code == 403 and "country" in detail.lower():
+        region_hint = (
+            "\n\nВероятная причина: OpenAI считает регион сервера неподдерживаемым. "
+            "Проверь регион Railway ниже и при необходимости перенеси сервис "
+            "в Amsterdam или US East."
+        )
+
+    message = (
+        f"{title}\n"
+        f"OpenAI вернул статус {status_code}.{region_hint}\n\n"
+        f"Версия: {APP_VERSION}\n"
+        f"Регион Railway: {get_railway_region()}\n"
+        f"Коммит Railway: {get_railway_commit()}\n"
+        f"Детали: {detail}"
     )
     return message[:3900]
 
